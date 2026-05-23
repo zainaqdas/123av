@@ -9,6 +9,8 @@
  */
 
 import * as cheerio from 'cheerio';
+import { execFile } from 'child_process';
+import { join } from 'path';
 import type { CheerioAPI } from 'cheerio';
 import type { CloudflareFetcher } from './fetcher';
 import type { Cache } from './cache';
@@ -22,6 +24,7 @@ import {
   VIDEO_CODE_REGEX,
   CSS_UTILITY_REGEX,
   AJAX_ENDPOINT_PATTERNS,
+  XOR_KEYS,
 } from './constants';
 
 export class Video {
@@ -265,8 +268,9 @@ export class Video {
     if (scriptM3u8) return scriptM3u8[0];
 
     // Strategy 3: Look for common stream URL patterns in scripts
-    // Sites often embed: "source":"https://...m3u8" or sourceUrl = "..."
-    const sourceUrlMatch = scriptContent.match(/(?:source|src|url|stream|file|video)["'\s:=]+(https?:\/\/[^"'\s]+\.(?:m3u8|mp4|ts)[^"'\s]*)/i);
+    const sourceUrlMatch = scriptContent.match(
+      /(?:source|src|url|stream|file|video)["'\s:=]+(https?:\/\/[^"'\s]+\.(?:m3u8|mp4|ts)[^"'\s]*)/i
+    );
     if (sourceUrlMatch) return sourceUrlMatch[1];
 
     // Strategy 4: Look for base64-encoded URLs
@@ -292,11 +296,19 @@ export class Video {
       return dataUrl; // Might be the URL directly
     }
 
-    // Strategy 6: Try fetching from known AJAX endpoint patterns
-    // The Movie component fetches stream data via an obfuscated AJAX endpoint.
-    // Try known patterns and cache the successful one for future use.
+    // Strategy 6: Try the confirmed AJAX endpoint with XOR-decoded watch URLs
+    // Discovered via Playwright network interception (May 2026):
+    // The Petite-Vue Movie component calls /en/ajax/v/{id}/videos
+    // which returns base64-XOR-encoded watch URLs pointing to surrit.store
     const m3u8FromAjax = await this.tryAjaxEndpoints();
     if (m3u8FromAjax) return m3u8FromAjax;
+
+    // Strategy 7: Browser-based extraction (Playwright headless Chromium)
+    // Loads the 123av.com video page in a real browser, clicks the player,
+    // and intercepts the dynamically-constructed m3u8 URL from network requests.
+    // This is the same approach used by the 123AV_app Android app.
+    const m3u8FromBrowser = await this.extractM3u8WithBrowser(this.url);
+    if (m3u8FromBrowser) return m3u8FromBrowser;
 
     return undefined;
   }
@@ -325,21 +337,25 @@ export class Video {
 
   /**
    * Try fetching stream data from known AJAX endpoint patterns.
-   * Iterates through common API patterns and returns the first m3u8 URL found.
-   * Caches successful patterns per video code for future use.
    *
-   * Note: This is a last-resort strategy that makes actual HTTP requests.
-   * All endpoints may return 404 if the site's API changes.
+   * The first pattern (/en/ajax/v/{id}/videos) is the confirmed endpoint
+   * discovered via Playwright network interception. It returns:
+   * {"status":200,"result":{"watch":[{"url":"base64-xor-encoded"}]}}
+   *
+   * The url field is base64-encoded after XOR encryption. We try common
+   * XOR keys to decode the watch URL, then follow the decoded URL
+   * (typically surrit.store) to extract m3u8 URLs.
+   *
+   * Caches successful patterns per video code for future use.
    */
   private async tryAjaxEndpoints(): Promise<string | undefined> {
-    // Check if we have a cached successful endpoint pattern for this code
     const cacheKey = `ajax:endpoint:${this.code}`;
     const cachedPattern = this.cache.get<string>(cacheKey);
-    
+
     // Build patterns: use cached pattern first if available, otherwise try all
     const patterns: string[] = cachedPattern
       ? [cachedPattern]
-      : AJAX_ENDPOINT_PATTERNS.map(p => 
+      : AJAX_ENDPOINT_PATTERNS.map(p =>
           p.replace('{id}', String(this.id)).replace('{code}', this.code)
         );
 
@@ -348,16 +364,28 @@ export class Video {
         const url = `${BASE_URL}${pattern}`;
         const response = await this.fetcher.fetch(url);
 
-        // Try to extract m3u8 URL from the response
+        // Try to extract m3u8 URL from the response directly
         const m3u8Match = response.match(M3U8_REGEX);
         if (m3u8Match) {
           this.cache.set(cacheKey, pattern);
           return m3u8Match[0];
         }
 
-        // Check if the response is JSON with a stream URL field
+        // Parse JSON response
         try {
           const json = JSON.parse(response);
+
+          // Handle confirmed endpoint format: {result: {watch: [{url: "..."}]}}
+          const watchUrls = json?.result?.watch;
+          if (watchUrls && Array.isArray(watchUrls)) {
+            const m3u8FromWatch = await this.decodeWatchUrls(watchUrls);
+            if (m3u8FromWatch) {
+              this.cache.set(cacheKey, pattern);
+              return m3u8FromWatch;
+            }
+          }
+
+          // Handle generic stream URL fields
           const streamUrl =
             json?.result?.streamUrl ||
             json?.result?.url ||
@@ -378,18 +406,202 @@ export class Video {
             }
           }
         } catch {
-        // Response is not JSON — that's fine
+          // Response is not JSON — that's fine
         }
       } catch {
         // Endpoint failed (404, timeout, etc.) — try next
         if (cachedPattern) {
-          // Cached pattern failed — evict it so next call tries all patterns
           this.cache.delete(cacheKey);
         }
       }
     }
 
     return undefined;
+  }
+
+  /**
+   * Decode base64-XOR-encoded watch URLs from the AJAX response.
+   *
+   * The watch[] array contains {url: "base64-xor-encoded"} objects.
+   * We base64-decode each URL, try XOR keys to decrypt, then follow
+   * the resulting stream URL to extract m3u8 URLs.
+   */
+  private async decodeWatchUrls(
+    watchUrls: Array<{ url: string; index?: number; name?: string }>
+  ): Promise<string | undefined> {
+    for (const watch of watchUrls) {
+      if (!watch.url) continue;
+
+      try {
+        const decoded = Buffer.from(watch.url, 'base64');
+        const decrypted = this.tryXorDecrypt(decoded);
+        if (!decrypted) continue;
+
+        // Check if the decrypted URL contains m3u8 directly
+        const m3u8Match = decrypted.match(M3U8_REGEX);
+        if (m3u8Match) return m3u8Match[0];
+
+        // Otherwise, it's a stream provider URL (surrit.store, etc.)
+        // Fetch it and look for m3u8 in the response
+        if (decrypted.startsWith('http')) {
+          const m3u8FromProvider = await this.fetchStreamProvider(decrypted);
+          if (m3u8FromProvider) return m3u8FromProvider;
+        }
+      } catch {
+        // Decode failure — try next watch URL
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Try to XOR-decrypt a buffer using common keys.
+   * Returns the decrypted string, or undefined if no key worked.
+   */
+  private tryXorDecrypt(data: Buffer): string | undefined {
+    // Try single-byte XOR keys (common for simple obfuscation)
+    for (let key = 0; key < 256; key++) {
+      const xored = Buffer.from(data.map(b => b ^ key));
+      const text = xored.toString('utf-8');
+      if (text.startsWith('http') && !text.includes('\x00')) {
+        return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, ''); // strip control chars
+      }
+    }
+
+    // Try string XOR keys
+    for (const keyStr of XOR_KEYS) {
+      const keyBytes = Buffer.from(keyStr);
+      const result = Buffer.alloc(data.length);
+
+      for (let i = 0; i < data.length; i++) {
+        result[i] = data[i] ^ keyBytes[i % keyBytes.length];
+      }
+
+      const text = result.toString('utf-8');
+      if (text.startsWith('http') && !text.includes('\x00')) {
+        return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Fetch a stream provider URL (surrit.store, etc.) and extract m3u8 URLs.
+   *
+   * Multi-strategy approach:
+   * 1. Static: Check response for m3u8 URLs or JSON with media field
+   * 2. Browser: If URL is surrit.store, use Playwright headless browser
+   *    to load the embed page and intercept the dynamically-constructed m3u8 URL
+   */
+  private async fetchStreamProvider(providerUrl: string): Promise<string | undefined> {
+    // ── Strategy 1: Static extraction ─────────────────────────
+    try {
+      const response = await this.fetcher.fetch(providerUrl);
+
+      // Check for m3u8 directly
+      const m3u8Match = response.match(M3U8_REGEX);
+      if (m3u8Match) return m3u8Match[0];
+
+      // Parse JSON and look for base64-encoded media field
+      try {
+        const json = JSON.parse(response);
+        const mediaB64 = json?.result?.media;
+
+        if (mediaB64 && typeof mediaB64 === 'string') {
+          const mediaDecoded = Buffer.from(mediaB64, 'base64').toString('utf-8');
+          const m3u8InMedia = mediaDecoded.match(M3U8_REGEX);
+          if (m3u8InMedia) return m3u8InMedia[0];
+
+          if (mediaDecoded.includes('#EXTM3U') || mediaDecoded.includes('#EXT-X-')) {
+            const streamUrlMatch = mediaDecoded.match(
+              /https?:\/\/[^\s]+\.(?:m3u8|ts)[^\s]*/i
+            );
+            if (streamUrlMatch) return streamUrlMatch[0];
+          }
+        }
+      } catch {
+        // Not JSON
+      }
+    } catch {
+      // Provider fetch failed for static — try browser below
+    }
+
+    // Browser-based extraction is handled by Strategy 7 in getM3u8Url()
+    // to avoid redundant browser launches for the same video page.
+    return undefined;
+  }
+
+  /**
+   * Use Playwright headless Chromium to load the 123av.com video page
+   * and intercept the dynamically-constructed m3u8 URL from network requests.
+   *
+   * The player (surrit.store) uses heavily obfuscated JavaScript that
+   * constructs the m3u8 URL at runtime. The only reliable way to extract
+   * it is via a real browser that executes the JavaScript.
+   *
+   * This is the same approach used by the 123AV_app Android app.
+   * Results are cached per video code to avoid repeated browser launches.
+   *
+   * @param videoPageUrl The full 123av.com video page URL
+   */
+  private async extractM3u8WithBrowser(videoPageUrl: string): Promise<string | undefined> {
+    const cacheKey = `browser:m3u8:${this.code}`;
+    const cached = this.cache.get<string>(cacheKey);
+    if (cached !== undefined) {
+      return cached || undefined;
+    }
+
+    try {
+      const { existsSync } = await import('fs');
+      let extractorPath = join(process.cwd(), 'src', 'surrit-extractor.ts');
+      if (!existsSync(extractorPath)) {
+        extractorPath = join(process.cwd(), '..', 'src', 'surrit-extractor.ts');
+      }
+      if (!existsSync(extractorPath)) {
+        return undefined;
+      }
+
+      // Resolve project root for cwd
+      const projectRoot = join(extractorPath, '..', '..');
+
+      const stdout = await new Promise<string>((resolve, reject) => {
+        execFile(
+          'npx',
+          ['tsx', extractorPath, videoPageUrl, '60000'],
+          {
+            timeout: 90000,
+            maxBuffer: 1024 * 1024,
+            cwd: projectRoot,
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              reject(new Error(stderr || error.message));
+              return;
+            }
+            const trimmed = stdout.trim();
+            if (trimmed.startsWith('ERROR:')) {
+              reject(new Error(trimmed));
+              return;
+            }
+            resolve(trimmed);
+          }
+        );
+      });
+
+      const m3u8Url = stdout.trim();
+      if (m3u8Url && m3u8Url.startsWith('http') && m3u8Url.includes('.m3u8')) {
+        this.cache.set(cacheKey, m3u8Url);
+        return m3u8Url;
+      }
+
+      this.cache.set(cacheKey, '');
+      return undefined;
+    } catch {
+      this.cache.set(cacheKey, '');
+      return undefined;
+    }
   }
 
   // ─── Convenience ───────────────────────────────────────────────

@@ -25,6 +25,8 @@ const SCRIPT_PATHS = [
   join(dirname(dirname(__dirname)), 'src', 'fetcher_helper.py'),
   // Relative to cwd
   join(process.cwd(), 'src', 'fetcher_helper.py'),
+  // Parent of cwd (for monorepo/subdirectory setups like Next.js in web/)
+  join(process.cwd(), '..', 'src', 'fetcher_helper.py'),
 ];
 
 /**
@@ -32,9 +34,23 @@ const SCRIPT_PATHS = [
  * Tries common locations including virtual environments.
  */
 function resolvePythonBinary(): string {
-  // Check project-level venv first (PEP 668 compliance for Ubuntu 24+)
-  const projectVenvPath = join(process.cwd(), 'bin', 'python3');
-  if (existsSync(projectVenvPath)) return projectVenvPath;
+  // Collect candidate paths (prefer cwd-local, then parent-dir for monorepos)
+  const candidates = [
+    // Pattern 1: python3 -m venv .  (creates bin/ at project root)
+    join(process.cwd(), 'bin', 'python3'),
+    // Pattern 2: python3 -m venv venv (creates venv/bin/)
+    join(process.cwd(), 'venv', 'bin', 'python3'),
+    // Pattern 3: python3 -m venv .venv (Poetry, uv, VS Code default)
+    join(process.cwd(), '.venv', 'bin', 'python3'),
+    // Parent-dir patterns for monorepo/subdirectory setups (e.g., Next.js in web/)
+    join(process.cwd(), '..', 'bin', 'python3'),
+    join(process.cwd(), '..', 'venv', 'bin', 'python3'),
+    join(process.cwd(), '..', '.venv', 'bin', 'python3'),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
 
   // Use python3 as system fallback (found on most systems)
   return 'python3';
