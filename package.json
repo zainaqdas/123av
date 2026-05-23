@@ -1,0 +1,22 @@
+{
+  "name": "123av-api",
+  "version": "1.0.0",
+  "description": "Unofficial Node.js/TypeScript scraper for 123av.com — extracts video metadata, stream URLs, and browses listings with Cloudflare bypass via curl_cffi",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
+  },
+  "keywords": ["123av", "scraper", "jav", "cloudflare", "curl_cffi"],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
