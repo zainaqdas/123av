@@ -592,7 +592,8 @@ export class Video {
 
       const m3u8Url = stdout.trim();
       if (m3u8Url && m3u8Url.startsWith('http') && m3u8Url.includes('.m3u8')) {
-        this.cache.set(cacheKey, m3u8Url);
+        // Cache m3u8 URLs for 6 hours — they rarely change
+        this.cache.set(cacheKey, m3u8Url, 6 * 60 * 60 * 1000);
         return m3u8Url;
       }
 
